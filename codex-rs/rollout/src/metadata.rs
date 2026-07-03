@@ -21,6 +21,7 @@ use codex_state::DB_ERROR_METRIC;
 use codex_state::DB_METRIC_BACKFILL;
 use codex_state::DB_METRIC_BACKFILL_DURATION_MS;
 use codex_state::ExtractionOutcome;
+use codex_state::ThreadMetadata;
 use codex_state::ThreadMetadataBuilder;
 use codex_state::apply_rollout_item;
 use std::path::Path;
@@ -98,40 +99,77 @@ pub async fn extract_metadata_from_rollout(
     rollout_path: &Path,
     default_provider: &str,
 ) -> anyhow::Result<ExtractionOutcome> {
-    let (items, _thread_id, parse_errors) =
-        RolloutRecorder::load_rollout_items(rollout_path).await?;
-    if items.is_empty() {
+    // Stream the rollout instead of loading every item into memory: session
+    // files can reach multiple GB (openai/codex#31040) and backfill visits
+    // every file under the sessions root. Items are buffered only until the
+    // FIRST SessionMeta yields a builder — in practice the first line — after
+    // which each item is applied and dropped. Files whose first SessionMeta
+    // cannot produce a builder keep buffering and fall back to
+    // `builder_from_items`, matching the previous non-streaming behavior.
+    let mut pending: Vec<RolloutItem> = Vec::new();
+    let mut metadata: Option<ThreadMetadata> = None;
+    let mut memory_mode = None;
+    let mut tried_first_session_meta = false;
+    let mut saw_items = false;
+    let (_thread_id, parse_errors) = RolloutRecorder::for_each_rollout_item(rollout_path, |item| {
+        saw_items = true;
+        if let RolloutItem::SessionMeta(meta_line) = &item
+            && let Some(mode) = meta_line.meta.memory_mode.clone()
+        {
+            memory_mode = Some(mode);
+        }
+        match metadata.as_mut() {
+            Some(metadata) => apply_rollout_item(metadata, &item, default_provider),
+            None => {
+                if let RolloutItem::SessionMeta(meta_line) = &item
+                    && !tried_first_session_meta
+                {
+                    tried_first_session_meta = true;
+                    if let Some(builder) = builder_from_session_meta(meta_line, rollout_path) {
+                        let mut built = builder.build(default_provider);
+                        for pending_item in pending.drain(..) {
+                            apply_rollout_item(&mut built, &pending_item, default_provider);
+                        }
+                        apply_rollout_item(&mut built, &item, default_provider);
+                        metadata = Some(built);
+                        return;
+                    }
+                }
+                pending.push(item);
+            }
+        }
+    })
+    .await?;
+    if !saw_items {
         return Err(anyhow::anyhow!(
             "empty session file: {}",
             rollout_path.display()
         ));
     }
-    let builder = builder_from_items(items.as_slice(), rollout_path).ok_or_else(|| {
-        anyhow::anyhow!(
-            "rollout missing metadata builder: {}",
-            rollout_path.display()
-        )
-    })?;
-    let mut metadata = builder.build(default_provider);
-    for item in &items {
-        apply_rollout_item(&mut metadata, item, default_provider);
-    }
+    let mut metadata = match metadata {
+        Some(metadata) => metadata,
+        None => {
+            let builder =
+                builder_from_items(pending.as_slice(), rollout_path).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "rollout missing metadata builder: {}",
+                        rollout_path.display()
+                    )
+                })?;
+            let mut built = builder.build(default_provider);
+            for pending_item in &pending {
+                apply_rollout_item(&mut built, pending_item, default_provider);
+            }
+            built
+        }
+    };
     if let Some(updated_at) = file_modified_time_utc(rollout_path).await {
         metadata.updated_at = updated_at;
         metadata.recency_at = updated_at;
     }
     Ok(ExtractionOutcome {
         metadata,
-        memory_mode: items.iter().rev().find_map(|item| match item {
-            RolloutItem::SessionMeta(meta_line) => meta_line.meta.memory_mode.clone(),
-            RolloutItem::ResponseItem(_)
-            | RolloutItem::InterAgentCommunication(_)
-            | RolloutItem::InterAgentCommunicationMetadata { .. }
-            | RolloutItem::Compacted(_)
-            | RolloutItem::TurnContext(_)
-            | RolloutItem::WorldState(_)
-            | RolloutItem::EventMsg(_) => None,
-        }),
+        memory_mode,
         parse_errors,
     })
 }

@@ -1240,3 +1240,139 @@ async fn resume_candidate_matches_cwd_reads_latest_turn_context() -> std::io::Re
     );
     Ok(())
 }
+
+#[tokio::test]
+async fn recorder_redacts_large_inline_images_in_persisted_compacted_history() -> anyhow::Result<()>
+{
+    use codex_protocol::models::ContentItem;
+    use codex_protocol::protocol::CompactedItem;
+
+    let home = TempDir::new().expect("temp dir");
+    let config = test_config(home.path());
+    let thread_id = ThreadId::new();
+    let recorder = RolloutRecorder::new(
+        &config,
+        RolloutRecorderParams::new(
+            thread_id,
+            /*forked_from_id*/ None,
+            /*parent_thread_id*/ None,
+            SessionSource::Exec,
+            /*thread_source*/ None,
+            "test_originator".to_string(),
+            BaseInstructions::default(),
+            Vec::new(),
+        ),
+    )
+    .await?;
+
+    let large_image_url = format!("data:image/png;base64,{}", "A".repeat(64 * 1024));
+    let small_image_url = "data:image/png;base64,c21hbGw=".to_string();
+    let remote_image_url = format!("https://example.com/{}.png", "b".repeat(64 * 1024));
+    let history_message = ResponseItem::Message {
+        id: None,
+        role: "user".to_string(),
+        content: vec![
+            ContentItem::InputText {
+                text: "keep-me".to_string(),
+            },
+            ContentItem::InputImage {
+                image_url: large_image_url.clone(),
+                detail: None,
+            },
+            ContentItem::InputImage {
+                image_url: small_image_url.clone(),
+                detail: None,
+            },
+            ContentItem::InputImage {
+                image_url: remote_image_url.clone(),
+                detail: None,
+            },
+        ],
+        phase: None,
+        internal_chat_message_metadata_passthrough: None,
+    };
+    let compacted = CompactedItem {
+        message: String::new(),
+        replacement_history: Some(vec![history_message.clone()]),
+        window_number: Some(1),
+        first_window_id: None,
+        previous_window_id: None,
+        window_id: None,
+    };
+    recorder
+        .record_canonical_items(&[
+            RolloutItem::Compacted(compacted),
+            // The same message OUTSIDE a compacted checkpoint must be
+            // persisted unchanged.
+            RolloutItem::ResponseItem(history_message),
+        ])
+        .await?;
+    recorder.flush().await?;
+    let rollout_path = recorder.rollout_path().to_path_buf();
+
+    let raw = fs::read_to_string(&rollout_path)?;
+    let compacted_line = raw
+        .lines()
+        .find(|line| line.contains("\"compacted\""))
+        .expect("compacted line should be persisted");
+    assert!(
+        !compacted_line.contains(&large_image_url),
+        "large inline image should be redacted from the persisted checkpoint"
+    );
+    assert!(
+        compacted_line.contains(REDACTED_COMPACTED_IMAGE_DATA_URL),
+        "redacted checkpoint should carry the placeholder data URL"
+    );
+    assert!(
+        compacted_line.contains(&small_image_url),
+        "small inline images should be persisted unchanged"
+    );
+    assert!(
+        compacted_line.contains(&remote_image_url),
+        "remote image references should be persisted unchanged"
+    );
+    let response_line = raw
+        .lines()
+        .find(|line| line.contains("\"response_item\""))
+        .expect("response_item line should be persisted");
+    assert!(
+        response_line.contains(&large_image_url),
+        "items outside compacted checkpoints should be persisted unchanged"
+    );
+
+    let (items, loaded_thread_id, parse_errors) =
+        RolloutRecorder::load_rollout_items(&rollout_path).await?;
+    assert_eq!(loaded_thread_id, Some(thread_id));
+    assert_eq!(parse_errors, 0);
+    let history = items
+        .iter()
+        .find_map(|item| match item {
+            RolloutItem::Compacted(compacted) => compacted.replacement_history.as_ref(),
+            _ => None,
+        })
+        .expect("reloaded rollout should contain the compacted checkpoint");
+    let ResponseItem::Message { content, .. } = &history[0] else {
+        panic!("compacted history should contain the user message");
+    };
+    assert_eq!(
+        content,
+        &vec![
+            ContentItem::InputText {
+                text: "keep-me".to_string(),
+            },
+            ContentItem::InputImage {
+                image_url: REDACTED_COMPACTED_IMAGE_DATA_URL.to_string(),
+                detail: None,
+            },
+            ContentItem::InputImage {
+                image_url: small_image_url,
+                detail: None,
+            },
+            ContentItem::InputImage {
+                image_url: remote_image_url,
+                detail: None,
+            },
+        ],
+    );
+    Ok(())
+}

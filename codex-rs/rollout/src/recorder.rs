@@ -15,6 +15,9 @@ use codex_protocol::ThreadId;
 use codex_protocol::capabilities::SelectedCapabilityRoot;
 use codex_protocol::dynamic_tools::DynamicToolSpec;
 use codex_protocol::models::BaseInstructions;
+use codex_protocol::models::ContentItem;
+use codex_protocol::models::ResponseItem;
+use serde::Deserialize;
 use serde_json::Value;
 use time::OffsetDateTime;
 use time::format_description::FormatItem;
@@ -930,11 +933,18 @@ impl RolloutRecorder {
         })?
     }
 
-    pub async fn load_rollout_items(
+    /// Stream rollout items from a session file without collecting them.
+    ///
+    /// Invokes `on_item` for each successfully parsed rollout line, in file
+    /// order, and returns the canonical thread id (from the FIRST SessionMeta
+    /// encountered) plus the number of unparseable lines. This keeps memory
+    /// bounded for callers that only need a running view of the file, such as
+    /// metadata extraction over multi-GB rollouts.
+    pub async fn for_each_rollout_item(
         path: &Path,
-    ) -> std::io::Result<(Vec<RolloutItem>, Option<ThreadId>, usize)> {
-        trace!("Resuming rollout from {path:?}");
-        let mut items: Vec<RolloutItem> = Vec::new();
+        mut on_item: impl FnMut(RolloutItem),
+    ) -> std::io::Result<(Option<ThreadId>, usize)> {
+        trace!("Reading rollout from {path:?}");
         let mut thread_id: Option<ThreadId> = None;
         let mut parse_errors = 0usize;
         let mut reader = compression::open_rollout_line_reader(path).await?;
@@ -957,8 +967,10 @@ impl RolloutRecorder {
                 continue;
             }
 
-            // Parse the rollout line structure
-            match serde_json::from_value::<RolloutLine>(v.clone()) {
+            // Deserialize from a borrow of the parsed document: rollout lines
+            // can reach tens of MB (compacted history snapshots), so cloning
+            // the full `Value` per line doubles the transient peak.
+            match RolloutLine::deserialize(&v) {
                 Ok(rollout_line) => {
                     let item = rollout_line.item;
                     // Use the FIRST SessionMeta encountered in the file as the canonical
@@ -968,7 +980,7 @@ impl RolloutRecorder {
                     {
                         thread_id = Some(session_meta_line.meta.id);
                     }
-                    items.push(item);
+                    on_item(item);
                 }
                 Err(e) => {
                     if thread_id.is_none() {
@@ -985,7 +997,15 @@ impl RolloutRecorder {
         if !saw_non_empty_line {
             return Err(IoError::other("empty session file"));
         }
+        Ok((thread_id, parse_errors))
+    }
 
+    pub async fn load_rollout_items(
+        path: &Path,
+    ) -> std::io::Result<(Vec<RolloutItem>, Option<ThreadId>, usize)> {
+        let mut items: Vec<RolloutItem> = Vec::new();
+        let (thread_id, parse_errors) =
+            Self::for_each_rollout_item(path, |item| items.push(item)).await?;
         tracing::debug!(
             "Resumed rollout with {} items, thread ID: {:?}, parse errors: {}",
             items.len(),
@@ -1076,6 +1096,61 @@ fn strip_legacy_ghost_snapshot_rollout_line(value: &mut Value) -> bool {
 
 fn is_legacy_ghost_snapshot_response_item(value: &Value) -> bool {
     value.get("type").and_then(Value::as_str) == Some("ghost_snapshot")
+}
+
+/// Written in place of large inline image payloads inside persisted compacted
+/// checkpoints: a 1x1 transparent PNG data URL, so the field stays a valid
+/// image reference for resume reconstruction and provider requests.
+pub const REDACTED_COMPACTED_IMAGE_DATA_URL: &str = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==";
+
+/// Inline images at or below this size are persisted unchanged.
+const REDACT_COMPACTED_IMAGE_MIN_BYTES: usize = 16 * 1024;
+
+/// Returns a copy of `item` with large inline image payloads in a compacted
+/// checkpoint's `replacement_history` replaced by
+/// [`REDACTED_COMPACTED_IMAGE_DATA_URL`], or `None` when nothing needs
+/// redaction (the common case, which avoids cloning the checkpoint).
+///
+/// Only `data:` URLs above [`REDACT_COMPACTED_IMAGE_MIN_BYTES`] are replaced;
+/// remote (`http(s)`) image references and small images are preserved.
+fn redact_compacted_inline_images(item: &RolloutItem) -> Option<RolloutItem> {
+    fn is_large_inline_image(content: &ContentItem) -> bool {
+        match content {
+            ContentItem::InputImage { image_url, .. } => {
+                image_url.starts_with("data:") && image_url.len() > REDACT_COMPACTED_IMAGE_MIN_BYTES
+            }
+            ContentItem::InputText { .. } | ContentItem::OutputText { .. } => false,
+        }
+    }
+
+    let RolloutItem::Compacted(compacted) = item else {
+        return None;
+    };
+    let history = compacted.replacement_history.as_ref()?;
+    let needs_redaction = history.iter().any(|response_item| match response_item {
+        ResponseItem::Message { content, .. } => content.iter().any(is_large_inline_image),
+        _ => false,
+    });
+    if !needs_redaction {
+        return None;
+    }
+
+    let mut compacted = compacted.clone();
+    if let Some(history) = compacted.replacement_history.as_mut() {
+        for response_item in history {
+            let ResponseItem::Message { content, .. } = response_item else {
+                continue;
+            };
+            for content_item in content {
+                if is_large_inline_image(content_item)
+                    && let ContentItem::InputImage { image_url, .. } = content_item
+                {
+                    *image_url = REDACTED_COMPACTED_IMAGE_DATA_URL.to_string();
+                }
+            }
+        }
+    }
+    Some(RolloutItem::Compacted(compacted))
 }
 
 fn truncate_fs_page(
@@ -1817,9 +1892,15 @@ impl JsonlWriter {
             .format(timestamp_format)
             .map_err(|e| IoError::other(format!("failed to format timestamp: {e}")))?;
 
+        // Persisted compacted checkpoints re-embed the full replacement
+        // history, so inline image payloads accumulate across compactions and
+        // screenshot-heavy rollouts snowball to GBs (#23257, #24948, #31040).
+        // Redact large inline images at persist time; the in-memory turn
+        // history handed to the model is untouched.
+        let redacted_item = redact_compacted_inline_images(rollout_item);
         let line = RolloutLineRef {
             timestamp,
-            item: rollout_item,
+            item: redacted_item.as_ref().unwrap_or(rollout_item),
         };
         self.write_line(&line).await
     }
