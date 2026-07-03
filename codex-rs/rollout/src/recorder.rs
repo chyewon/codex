@@ -16,6 +16,8 @@ use codex_protocol::capabilities::SelectedCapabilityRoot;
 use codex_protocol::dynamic_tools::DynamicToolSpec;
 use codex_protocol::models::BaseInstructions;
 use codex_protocol::models::ContentItem;
+use codex_protocol::models::FunctionCallOutputBody;
+use codex_protocol::models::FunctionCallOutputContentItem;
 use codex_protocol::models::ResponseItem;
 use serde::Deserialize;
 use serde_json::Value;
@@ -1103,44 +1105,51 @@ fn is_legacy_ghost_snapshot_response_item(value: &Value) -> bool {
 /// image reference for resume reconstruction and provider requests.
 pub const REDACTED_COMPACTED_IMAGE_DATA_URL: &str = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==";
 
+/// Bare-base64 form of [`REDACTED_COMPACTED_IMAGE_DATA_URL`], for fields that
+/// hold raw base64 image bytes rather than a data URL.
+pub const REDACTED_COMPACTED_IMAGE_B64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==";
+
 /// Inline images at or below this size are persisted unchanged.
 const REDACT_COMPACTED_IMAGE_MIN_BYTES: usize = 16 * 1024;
 
-/// Returns a copy of `item` with large inline image payloads in a compacted
-/// checkpoint's `replacement_history` replaced by
-/// [`REDACTED_COMPACTED_IMAGE_DATA_URL`], or `None` when nothing needs
-/// redaction (the common case, which avoids cloning the checkpoint).
-///
-/// Only `data:` URLs above [`REDACT_COMPACTED_IMAGE_MIN_BYTES`] are replaced;
-/// remote (`http(s)`) image references and small images are preserved.
-fn redact_compacted_inline_images(item: &RolloutItem) -> Option<RolloutItem> {
-    fn is_large_inline_image(content: &ContentItem) -> bool {
-        match content {
-            ContentItem::InputImage { image_url, .. } => {
-                image_url.starts_with("data:") && image_url.len() > REDACT_COMPACTED_IMAGE_MIN_BYTES
-            }
-            ContentItem::InputText { .. } | ContentItem::OutputText { .. } => false,
+fn is_large_inline_image(content: &ContentItem) -> bool {
+    match content {
+        ContentItem::InputImage { image_url, .. } => {
+            image_url.starts_with("data:") && image_url.len() > REDACT_COMPACTED_IMAGE_MIN_BYTES
         }
+        ContentItem::InputText { .. } | ContentItem::OutputText { .. } => false,
     }
+}
 
-    let RolloutItem::Compacted(compacted) = item else {
-        return None;
-    };
-    let history = compacted.replacement_history.as_ref()?;
-    let needs_redaction = history.iter().any(|response_item| match response_item {
+fn is_large_tool_output_inline_image(item: &FunctionCallOutputContentItem) -> bool {
+    match item {
+        FunctionCallOutputContentItem::InputImage { image_url, .. } => {
+            image_url.starts_with("data:") && image_url.len() > REDACT_COMPACTED_IMAGE_MIN_BYTES
+        }
+        FunctionCallOutputContentItem::InputText { .. }
+        | FunctionCallOutputContentItem::EncryptedContent { .. } => false,
+    }
+}
+
+fn response_item_needs_image_redaction(response_item: &ResponseItem) -> bool {
+    match response_item {
         ResponseItem::Message { content, .. } => content.iter().any(is_large_inline_image),
+        ResponseItem::ImageGenerationCall { result, .. } => {
+            result.len() > REDACT_COMPACTED_IMAGE_MIN_BYTES
+        }
+        ResponseItem::FunctionCallOutput { output, .. } => match &output.body {
+            FunctionCallOutputBody::ContentItems(items) => {
+                items.iter().any(is_large_tool_output_inline_image)
+            }
+            FunctionCallOutputBody::Text(_) => false,
+        },
         _ => false,
-    });
-    if !needs_redaction {
-        return None;
     }
+}
 
-    let mut compacted = compacted.clone();
-    if let Some(history) = compacted.replacement_history.as_mut() {
-        for response_item in history {
-            let ResponseItem::Message { content, .. } = response_item else {
-                continue;
-            };
+fn redact_response_item_inline_images(response_item: &mut ResponseItem) {
+    match response_item {
+        ResponseItem::Message { content, .. } => {
             for content_item in content {
                 if is_large_inline_image(content_item)
                     && let ContentItem::InputImage { image_url, .. } = content_item
@@ -1148,6 +1157,50 @@ fn redact_compacted_inline_images(item: &RolloutItem) -> Option<RolloutItem> {
                     *image_url = REDACTED_COMPACTED_IMAGE_DATA_URL.to_string();
                 }
             }
+        }
+        ResponseItem::ImageGenerationCall { result, .. }
+            if result.len() > REDACT_COMPACTED_IMAGE_MIN_BYTES =>
+        {
+            *result = REDACTED_COMPACTED_IMAGE_B64.to_string();
+        }
+        ResponseItem::FunctionCallOutput { output, .. } => {
+            if let FunctionCallOutputBody::ContentItems(items) = &mut output.body {
+                for item in items {
+                    if is_large_tool_output_inline_image(item)
+                        && let FunctionCallOutputContentItem::InputImage { image_url, .. } = item
+                    {
+                        *image_url = REDACTED_COMPACTED_IMAGE_DATA_URL.to_string();
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Returns a copy of `item` with large inline image payloads in a compacted
+/// checkpoint's `replacement_history` replaced by
+/// [`REDACTED_COMPACTED_IMAGE_DATA_URL`] (or its bare-base64 form for
+/// `ImageGenerationCall` results), or `None` when nothing needs redaction
+/// (the common case, which avoids cloning the checkpoint).
+///
+/// Covers inline images in message content, tool-call output content items,
+/// and image-generation results. Only inline payloads above
+/// [`REDACT_COMPACTED_IMAGE_MIN_BYTES`] are replaced; remote (`http(s)`)
+/// image references and small images are preserved.
+fn redact_compacted_inline_images(item: &RolloutItem) -> Option<RolloutItem> {
+    let RolloutItem::Compacted(compacted) = item else {
+        return None;
+    };
+    let history = compacted.replacement_history.as_ref()?;
+    if !history.iter().any(response_item_needs_image_redaction) {
+        return None;
+    }
+
+    let mut compacted = compacted.clone();
+    if let Some(history) = compacted.replacement_history.as_mut() {
+        for response_item in history {
+            redact_response_item_inline_images(response_item);
         }
     }
     Some(RolloutItem::Compacted(compacted))

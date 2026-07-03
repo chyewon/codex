@@ -1245,6 +1245,9 @@ async fn resume_candidate_matches_cwd_reads_latest_turn_context() -> std::io::Re
 async fn recorder_redacts_large_inline_images_in_persisted_compacted_history() -> anyhow::Result<()>
 {
     use codex_protocol::models::ContentItem;
+    use codex_protocol::models::FunctionCallOutputBody;
+    use codex_protocol::models::FunctionCallOutputContentItem;
+    use codex_protocol::models::FunctionCallOutputPayload;
     use codex_protocol::protocol::CompactedItem;
 
     let home = TempDir::new().expect("temp dir");
@@ -1291,9 +1294,35 @@ async fn recorder_redacts_large_inline_images_in_persisted_compacted_history() -
         phase: None,
         internal_chat_message_metadata_passthrough: None,
     };
+    let large_generated_image = "G".repeat(64 * 1024);
+    let generation_call = ResponseItem::ImageGenerationCall {
+        id: Some("imggen-1".to_string()),
+        status: "completed".to_string(),
+        revised_prompt: None,
+        result: large_generated_image.clone(),
+        internal_chat_message_metadata_passthrough: None,
+    };
+    let large_tool_image_url = format!("data:image/png;base64,{}", "T".repeat(64 * 1024));
+    let tool_output = ResponseItem::FunctionCallOutput {
+        id: None,
+        call_id: "call-1".to_string(),
+        internal_chat_message_metadata_passthrough: None,
+        output: FunctionCallOutputPayload {
+            body: FunctionCallOutputBody::ContentItems(vec![
+                FunctionCallOutputContentItem::InputText {
+                    text: "tool-text".to_string(),
+                },
+                FunctionCallOutputContentItem::InputImage {
+                    image_url: large_tool_image_url.clone(),
+                    detail: None,
+                },
+            ]),
+            success: Some(true),
+        },
+    };
     let compacted = CompactedItem {
         message: String::new(),
-        replacement_history: Some(vec![history_message.clone()]),
+        replacement_history: Some(vec![history_message.clone(), generation_call, tool_output]),
         window_number: Some(1),
         first_window_id: None,
         previous_window_id: None,
@@ -1330,6 +1359,14 @@ async fn recorder_redacts_large_inline_images_in_persisted_compacted_history() -
     assert!(
         compacted_line.contains(&remote_image_url),
         "remote image references should be persisted unchanged"
+    );
+    assert!(
+        !compacted_line.contains(&large_generated_image),
+        "image generation results should be redacted from the persisted checkpoint"
+    );
+    assert!(
+        !compacted_line.contains(&large_tool_image_url),
+        "tool-output inline images should be redacted from the persisted checkpoint"
     );
     let response_line = raw
         .lines()
@@ -1374,5 +1411,39 @@ async fn recorder_redacts_large_inline_images_in_persisted_compacted_history() -
             },
         ],
     );
+    let ResponseItem::ImageGenerationCall { result, .. } = &history[1] else {
+        panic!("compacted history should retain the image generation call");
+    };
+    assert_eq!(
+        result, REDACTED_COMPACTED_IMAGE_B64,
+        "image generation result should round-trip as the bare-base64 placeholder"
+    );
+    let ResponseItem::FunctionCallOutput {
+        call_id, output, ..
+    } = &history[2]
+    else {
+        panic!("compacted history should retain the tool output");
+    };
+    assert_eq!(call_id, "call-1", "call pairing must be preserved");
+    assert_eq!(
+        output.body,
+        FunctionCallOutputBody::ContentItems(vec![
+            FunctionCallOutputContentItem::InputText {
+                text: "tool-text".to_string(),
+            },
+            FunctionCallOutputContentItem::InputImage {
+                image_url: REDACTED_COMPACTED_IMAGE_DATA_URL.to_string(),
+                detail: None,
+            },
+        ]),
+    );
+
+    // The resume entry point must consume the redacted rollout cleanly.
+    let initial_history = RolloutRecorder::get_rollout_history(&rollout_path).await?;
+    let InitialHistory::Resumed(resumed) = initial_history else {
+        panic!("expected resumed history from the redacted rollout");
+    };
+    assert_eq!(resumed.conversation_id, thread_id);
+    assert_eq!(resumed.history.len(), items.len());
     Ok(())
 }
